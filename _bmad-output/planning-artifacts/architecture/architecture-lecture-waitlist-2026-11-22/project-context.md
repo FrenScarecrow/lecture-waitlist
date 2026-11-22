@@ -2,7 +2,7 @@
 title: 讲座报名与候补系统 — 项目上下文 (project-context.md)
 status: final
 created: 2026-11-22
-updated: 2026-11-22
+updated: 2026-11-23
 companion: architecture.md
 ---
 
@@ -53,7 +53,7 @@ lecture-waitlist/               # 仓库根目录
 ### 规则 2 — 事务边界（强制）
 
 - 所有**写**操作必须在 `@Transactional` Service 方法内完成；禁止在事务外写库。
-- 事务内只做 DB 读写；禁止在事务内做网络 / 文件 IO、`Thread.sleep` 等耗时操作（保持事务短，配合 P95≤1s）。
+- 事务内只做 DB 读写；禁止在事务内做网络 / 文件 IO、`Thread.sleep` 等耗时操作（保持事务短；取消事务提交即完成补位，不依赖后台任务）。
 - `@Transactional` 经 Spring 代理才生效，禁止同类内 `this.xxx()` 自调用绕过事务代理。
 - 只读请求不加事务。
 
@@ -81,10 +81,10 @@ lecture-waitlist/               # 仓库根目录
 
   ```java
   // 取队首（FOR UPDATE 锁候补行）
-  WaitlistEntry head = waitlistMapper.selectHeadForUpdate(lectureId); // ORDER BY cohort, sort_ts LIMIT 1 FOR UPDATE
+  WaitlistEntry head = waitlistMapper.selectHeadForUpdate(lectureId); // ORDER BY CASE cohort WHEN 'front' THEN 0 ELSE 1 END, sort_ts LIMIT 1 FOR UPDATE
   if (head == null) return;               // 无候补者，仅释放名额
   waitlistMapper.deleteById(head.getId()); // 硬删除原子消费
-  registrationMapper.insert(new Registration(lecture, head.getStudentId(), "promoted"));
+  registrationMapper.insert(new Registration(lecture, head.getStudentId(), "promoted", head.getSortTs())); // first_entered_at = 候补行 sort_ts（删前已取出）
   ```
 
 - 禁止在取消 / 扩容里各自实现一遍补位逻辑。
@@ -97,7 +97,7 @@ lecture-waitlist/               # 仓库根目录
 ### 规则 7 — 时间一律存 UTC
 
 - 时间统一用 Java `Instant` / `OffsetDateTime`（JDBC 存 `DATETIME`，值一律 UTC）。
-- 边界判断（报名窗口、退出候补最晚 min(截止, 开始前 30min)、调容量窗口、讲座状态派生）**一律用 UTC 比较**；只在展示层（Vue 端）转 Asia/Shanghai。
+- 边界判断（报名窗口、退出候补最晚 = 报名截止、调容量窗口、讲座状态派生）**一律用 UTC 比较**；只在展示层（Vue 端）转 Asia/Shanghai。
 - 禁止用 `LocalDateTime.now()` 默认时区 + 字符串比较做边界判断。
 
 ### 规则 8 — 错误码规范
@@ -145,17 +145,19 @@ lecture-waitlist/               # 仓库根目录
 
   ```sql
   SELECT …, ROW_NUMBER() OVER (
-    PARTITION BY lecture_id ORDER BY cohort, sort_ts
+    PARTITION BY lecture_id ORDER BY CASE cohort WHEN 'front' THEN 0 ELSE 1 END, sort_ts
   ) AS seq FROM waitlist_entry WHERE lecture_id = ?
   ```
 
-- 禁止把顺序号作为可变字段存储；`joined_at` 只是审计时间戳，**不参与排序**（排序键是 `cohort + sort_ts`，见规则 13）。
+- 禁止把顺序号作为可变字段存储；`joined_at` 只是审计时间戳，**不参与排序**（排序键是 `cohort`（数值优先级）+ `sort_ts`，见规则 13）。
 
 ### 规则 13 — 缩容移入者的排序语义
 
-- 缩容把超出的报名者转候补时，其排序键必须是「队首、内部按原报名先后」：
+- 缩容把超出的报名者转候补时，其排序键必须是「队首、内部按首次进入该讲座队列的时间先后」：
   - `cohort = 'front'`（排最前）
-  - `sort_ts = 原 registration.registered_at`
+  - `sort_ts` = 该 `registration.first_entered_at`（直接读报名行；不依赖已删除的候补行、也不查 `audit_log`）。
+  - 原因：补位者的报名时间（`registered_at`）是补位那一刻，用它排序会把等得最久的人排到后面；`first_entered_at` 才是其首次进入队列的时间。
+- `first_entered_at` = 本次报名生命周期内首次进入该讲座队列的时间；取消报名后重新加入候补视为新生命周期、重新计时。
 - 禁止简单用当前时间 join 到队尾。
 
 ### 规则 14 — 鉴权与角色
@@ -170,3 +172,38 @@ lecture-waitlist/               # 仓库根目录
 - **部署同源**：构建期把 Vue 产物复制进后端 `src/main/resources/static/`，由后端单端口同时托管前端页面与 `/api`（同一域、零 CORS）；开发期 Vite dev server 把 `/api` 代理到后端。**禁止前端 5173 跨域直连后端 8080**（否则 CORS + 会话 cookie SameSite 问题）。
 - **前端路由用 hash 模式**（`createWebHashHistory()`），避免 history 模式下刷新子路由 404（后端不配 SPA fallback 时）。
 - 前端展示用 UTC→Asia/Shanghai 转换；业务边界判断一律由后端（规则 7）完成，前端不做业务时间数学。
+
+### 规则 16 — 候补清空定时任务（强制）
+
+- 候补清空只用**一个进程内 `@Scheduled`**（`fixedDelay = 60s`），随应用启动、非独立进程；只处理 `reg_deadline` 已过且仍有候补行的讲座。
+- 每场讲座一个**独立事务**；先按规则 3 的同一顺序锁 `lecture` 行（`FOR UPDATE`）再删候补行。
+- 先 `DELETE` 候补行、后写通知与审计（同事务）；删除影响行数为 0 则直接跳过（幂等，重复轮次无副作用）。
+- 每轮最多处理 20 场，超出留待下一轮，避免单轮长事务。
+- 验收前提：**服务持续运行**（`docker compose up` / `java -jar` 启动后不关闭），定时任务随应用生命周期存在。
+
+### 规则 17 — 加锁前禁止一致性读
+
+- MySQL `REPEATABLE READ` 下，事务第一次普通 `SELECT` 会建立一致性快照。
+- 对同一讲座的**写事务**，第一条 SQL 必须是 `SELECT ... FOR UPDATE` 锁 `lecture` 行（见规则 3）。
+- 加锁前**禁止**对该讲座做任何普通 `SELECT`；容量判断只能在加锁之后进行。
+
+### 规则 18 — 补位删除校验影响行数
+
+- 补位时执行 `DELETE FROM waitlist_entry WHERE id = ? AND lecture_id = ?`，**影响行数为 1** 才允许 `INSERT registration`。
+- 影响行数为 0 说明该候补行已被其他事务消费（并发补位），直接返回、不再 `INSERT`。
+- 这是 NFR-2 幂等在代码级的落点。
+
+### 规则 19 — 测试规则
+
+- 测试框架：JUnit 5 + Spring Boot Test。
+- 时间相关逻辑注入 `java.time.Clock`，测试传固定时钟；禁止直接调 `now()`。
+- 并发正确性：100 线程抢最后一个名额，断言成功数恰好 1。
+- 补位幂等：并发触发两次取消，断言只有一条补位记录。
+- 数据库：有 Docker 用 Testcontainers MySQL；无 Docker 连本地独立测试库；连接参数写 `application-test.yml`。
+
+### 规则 20 — 构建规则
+
+- 前端：`npm ci && npm run build`，产物输出到 `backend/src/main/resources/static`。
+- 后端：`mvn clean package` 打可执行 jar。
+- 根目录提供 `build.sh` 与 `build.cmd`；README 只写这一条命令。
+- Docker（`docker compose up`）作为可选方案。

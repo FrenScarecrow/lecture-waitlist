@@ -2,7 +2,7 @@
 title: 讲座报名与候补系统 — 架构决策记录 (architecture.md)
 status: final
 created: 2026-11-22
-updated: 2026-11-22
+updated: 2026-11-23
 stack: Vue 3 + Spring Boot 4 + MyBatis + MySQL 8.4 + Java 21
 ---
 
@@ -21,7 +21,7 @@ stack: Vue 3 + Spring Boot 4 + MyBatis + MySQL 8.4 + Java 21
 **被否决的备选方案**：
 
 - **前端跨域直连后端（前端 5173 直接调后端 8080）** —— 否决理由：引入 CORS 配置与会话 cookie 的 SameSite / 凭证携带问题，单机 + 无运维下是纯麻烦；同源（后端托管 / Vite 代理）让会话 cookie 天然可用、零 CORS。
-- **Nginx 反代托管前端** —— 否决理由：需要额外部署、配置 Nginx 组件，单机无运维下是额外运维面；后端托管前端构建产物即可同源，无需第三个进程。
+- **Nginx 反代托管前端** —— 否决理由：四周工期下，Nginx 只增加部署与配置成本，对本课程考察的并发正确性与补位一致性没有贡献；后端直接托管前端构建产物即可实现同源，无需第三个进程。
 
 **后果**：代码保持 front / back 两个独立工程，构建期合并，运行态单 jar 单端口同源，评审机一条命令即可。
 
@@ -90,11 +90,11 @@ flowchart TB
 
 ## ADR-006 — 补位触发机制与幂等：同步触发 + 硬删除原子消费
 
-**决策**：补位**同步触发**——在「取消报名」和「扩容」的**同一个 `@Transactional` 事务内**完成（满足「取消事务提交即完成补位，P95≤1s」）。幂等靠「取队首 + **硬删除原子消费**」：`DELETE FROM waitlist_entry WHERE id = :headId` 删掉队首后，再 `INSERT` 一条 `registration(source='promoted')`。行锁串行化下天然不双补；`UNIQUE(lecture_id, student_id)` 兜底。
+**决策**：补位**同步触发**——在「取消报名」和「扩容」的**同一个 `@Transactional` 事务内**完成（满足「取消事务提交即完成补位，不依赖后台任务」）。幂等靠「取队首 + **硬删除原子消费**」：`DELETE FROM waitlist_entry WHERE id = :headId` 删掉队首后，再 `INSERT` 一条 `registration(source='promoted')`。行锁串行化下天然不双补；`UNIQUE(lecture_id, student_id)` 兜底。
 
 **被否决的备选方案**：
 
-- **定时扫描（cron / 定时任务）** —— 否决理由：违背「取消事务提交即完成补位，P95≤1s」的硬指标，且需要后台调度进程，与「评审机一条命令起服务、单机无运维、无消息队列」冲突。
+- **定时扫描（cron / 定时任务）** —— 否决理由：违背「取消事务提交即完成补位，不依赖后台任务」的硬指标——补位必须与取消同事务同步完成，不能用定时任务延迟补位。
 - **消息队列 / 事件驱动** —— 否决理由：被约束明确禁止。
 - **同步 + 兜底扫描（混合）** —— 否决理由：为单机规模引入第二套补位路径，四周工期里属过度设计。
 
@@ -104,7 +104,7 @@ flowchart TB
 
 ## ADR-007 — 候补顺序号生成与缩容插队：复合排序键 + `ROW_NUMBER()` 读时计算
 
-**决策**：候补顺序由**复合排序键 `(cohort, sort_ts)`** 决定；顺序号是**读时**用 `ROW_NUMBER() OVER (PARTITION BY lecture_id ORDER BY cohort, sort_ts)` 计算的排名，不落库。`cohort` 取 `front`（缩容移入者，排最前）与 `normal`；正常加入 `sort_ts = joined_at`，缩容移入 `sort_ts = 原报名时间`。
+**决策**：候补顺序由**复合排序键 `(cohort, sort_ts)`** 决定，其中 `cohort` 按**数值优先级**比较（`front`→0、`normal`→1），不依赖 `'front' < 'normal'` 的字符串字典序；顺序号是**读时**用 `ROW_NUMBER() OVER (PARTITION BY lecture_id ORDER BY CASE cohort WHEN 'front' THEN 0 ELSE 1 END, sort_ts)` 计算的排名，不落库。`cohort` 取 `front`（缩容移入者，排最前）与 `normal`；正常加入 `sort_ts = joined_at`，缩容移入 `sort_ts = registration.first_entered_at`。
 
 **被否决的备选方案**：
 
@@ -149,7 +149,7 @@ flowchart TB
 
 **被否决的备选方案**：
 
-- **Nginx 反代（三容器）** —— 否决理由：需要额外部署、配置 Nginx，单机无运维下是额外运维面；后端托管前端构建即可同源，无需第三个进程。
+- **Nginx 反代（三容器）** —— 否决理由：四周工期下，Nginx 只增加部署与配置成本，对本课程考察的并发正确性与补位一致性没有贡献；后端直接托管前端构建产物即可实现同源，无需第三个进程。
 - **裸 `java -jar` + 手动建库 / 迁移 / 初始化** —— 否决理由：违背「评审机一条命令起服务」，把建库 / 迁移 / 初始化的手工步骤丢给不懂运维的助教。
 - **云托管 / 远程数据库** —— 否决理由：被约束明确禁止（任何云服务），且是单机内网场景。
 
@@ -157,16 +157,16 @@ flowchart TB
 
 ---
 
-## ADR-011 — 时间触发的流转：惰性 + 幂等，无后台 worker
+## ADR-011 — 时间触发的流转：读时派生状态 + 进程内定时清空候补
 
-**决策**：讲座状态（已发布 / 已开始 / 已结束）**读时按当前时间对 `start_at`/`end_at` 派生**，不落状态列；「报名截止自动清空候补」**惰性 + 幂等**执行——任何触及该讲座的读取或写事务，若发现 `now > reg_deadline` 且仍有候补行，即在同一事务内 `DELETE` 清空候补并写通知；重复执行因已无行而无副作用。全系统**不引入后台 worker / cron / 定时任务**。
+**决策**：讲座状态（已发布 / 已开始 / 已结束）**读时按当前时间对 `start_at`/`end_at` 派生**，不落状态列；「报名截止自动清空候补」由**进程内定时任务**执行——Spring `@Scheduled`（`fixedDelay = 60s`），随应用启动、跑在同一 JVM 内，不是独立进程，一条命令起服务即自带；每轮扫描 `now > reg_deadline` 且仍有候补行的讲座，在事务内 `DELETE` 清空候补并写通知，重复执行因已无行而无副作用（幂等）。
 
 **被否决的备选方案**：
 
-- **后台 cron / 定时任务扫描清空** —— 否决理由：需要额外调度进程，与「评审机一条命令起服务、单机无运维、无消息队列」冲突。
-- **持久化状态列 + 定时翻转** —— 否决理由：需要 worker 在起止时刻翻状态，同样违反无后台约束；状态本就是时间的纯函数，派生无漂移。
+- **惰性清空（触及该讲座的读写事务内顺带清空）** —— 否决理由：依赖访问触发、无人访问则永不清空；停机期间到期不生效；把写副作用藏在只读接口里、与「只读请求不加事务」语义冲突；通知延迟到下一次访问才产生。
+- **持久化状态列 + 定时翻转** —— 否决理由：需要 worker 在起止时刻翻状态，状态本就是时间的纯函数，派生无漂移。
 
-**后果**：状态流转与截止清空零后台依赖，评审机单进程即可。
+**后果**：状态流转零后台依赖；候补清空由单进程内定时任务保证「报名截止后 1 分钟内清空并通知」（SM-4），评审机一条命令起服务即可。
 
 ---
 
@@ -198,8 +198,8 @@ erDiagram
 | 实体 | 关键字段 | 约束 / 语义 |
 | --- | --- | --- |
 | `user` | `username`(学号)、`password_hash`、`role`、`name` | `username` 唯一；`role` ∈ {student, admin} |
-| `lecture` | `title`、`start_at`/`end_at`、`capacity`、`reg_open_at`(可空)、`reg_deadline`、可选地点/主讲人/类型 | 无 `status` 列（读时派生） |
-| `registration` | `lecture_id`、`student_id`、`source`(direct/promoted)、`registered_at` | `UNIQUE(lecture_id, student_id)`；取消即删行 |
+| `lecture` | `title`、`start_at`/`end_at`、`capacity`、`reg_open_at`(可空)、`reg_deadline`、`created_at`、可选地点/主讲人/类型 | 无 `status` 列（读时派生）；`created_at` = 发布时间（FR-12 容量窗口起点）；`reg_deadline` = 由 `start_at` 减 30 分钟在发布时计算并写入，非管理员输入 |
+| `registration` | `lecture_id`、`student_id`、`source`(direct/promoted)、`registered_at`、`first_entered_at`(NOT NULL) | `UNIQUE(lecture_id, student_id)`；取消即删行；`first_entered_at` = 本次报名生命周期内首次进入该讲座队列的时间（直接报名 = `registered_at`；补位 = 被消费候补行的 `sort_ts`） |
 | `waitlist_entry` | `lecture_id`、`student_id`、`cohort`(front/normal)、`sort_ts`、`joined_at` | `UNIQUE(lecture_id, student_id)`；补位/退出/清空即删行 |
 | `notification` | `user_id`、`text`、`is_read`、`created_at` | 同事务写入 |
-| `audit_log` | `actor_id`、`lecture_id`、`action`、`before`/`after`、`created_at` | append-only，历史唯一来源 |
+| `audit_log` | `actor_id`、`actor_type`(system/user)、`lecture_id`、`action`、`seq`、`cohort`、`sort_ts`、`before`/`after`、`created_at` | append-only，历史唯一来源；硬删除后靠 `seq`/`cohort`/`sort_ts` 还原候补队列（`sort_ts` 仅用于审计还原，不参与业务排序） |
